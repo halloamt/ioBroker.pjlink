@@ -55,7 +55,8 @@ class Pjlink extends utils.Adapter {
         this.statusQueryInfo.shortPowered = [];
         this.numStatusQryForInfo = 1; // after this number of status query a information query will be processed
         this.actStatusQryForInfo = 0; // actual number of skipped status queries
-        this.unavailableTime = false; // true if the projector send the error "unavailable time" for the first time
+        this.activeErrors = new Set(); // keys of errors already logged. Each error is logged only once until it is resolved
+        this.reconnectAttempts = 0; // number of reconnect attempts since the last established connection
         this.timers = {}; // a place to store timers
         this.timers.reconnectDelay = undefined;
         this.timers.statusDelay = undefined;
@@ -151,7 +152,13 @@ class Pjlink extends utils.Adapter {
      */
     reconnectProjector() {
         try {
-            this.log.info(`PJLink trying to (re)connect to projector`);
+            // log the first attempt as info, all following attempts only as debug
+            if (this.reconnectAttempts === 0) {
+                this.log.info(`PJLink trying to (re)connect to projector`);
+            } else {
+                this.log.debug(`PJLink trying to (re)connect to projector (attempt ${this.reconnectAttempts + 1})`);
+            }
+            this.reconnectAttempts++;
             // only the getPowerState for now
             this.projector.connect();
             //this.projector.getPowerState(this.pjlinkAnswerHandler.bind(this, 'GETPOWERSTATE'));
@@ -359,12 +366,11 @@ class Pjlink extends utils.Adapter {
             if (error) {
                 switch (error.message) {
                     case 'Unavailable time':
-                        if (!this.unavailableTime) {
-                            this.unavailableTime = true;
-                            this.log.warn(
-                                `pjlinkAnswerHandler (command: ${command}), Projector is actualy unavailable. This is only logged once`,
-                            );
-                        }
+                        this.logOnce(
+                            'Unavailable time',
+                            'warn',
+                            `pjlinkAnswerHandler (command: ${command}), Projector is actualy unavailable`,
+                        );
                         break;
 
                     case 'Undefined command':
@@ -372,15 +378,15 @@ class Pjlink extends utils.Adapter {
                     case 'Authorization failed':
                     case 'Command reply mismatch':
                     case 'Not connected':
-                        this.unavailableTime = false;
-                        this.log.error(
+                        this.logOnce(
+                            `${command}|${error.message}`,
+                            'error',
                             `pjlinkAnswerHandler (command: ${command}), Projector send error: ${error.message}`,
                         );
                         break;
 
                     case 'Projector/Display failure':
                     default:
-                        this.unavailableTime = true;
                         this.errorHandler(error, `pjlinkAnswerHandler (command: ${command})`);
                         // reset connection state
                         this.setState('info.connection', false, true);
@@ -401,12 +407,13 @@ class Pjlink extends utils.Adapter {
                 state = pjlinkValues[1];
                 this.log.debug(`PJLink got answer from command: '${command}', value '${JSON.stringify(state)}'`);
 
-                // reset unavailable time
-                this.unavailableTime = false;
+                // communication works, so all previous errors are resolved
+                this.resetErrors();
 
                 // only if the reconnect timer is not cleared, this means, that the connection has been freshley established
                 if (this.timers.reconnectDelay) {
                     this.log.info(`PJLink established connection to the projector`);
+                    this.reconnectAttempts = 0;
 
                     // get the status info on startup
                     this.doStatusQuery('startup');
@@ -591,7 +598,44 @@ class Pjlink extends utils.Adapter {
      * @param {string} module module name in which the error occured
      */
     errorHandler(err, module = '') {
-        this.log.error(`PJLink error in method: [${module}] error: ${err.message}, stack: ${err.stack}`);
+        const message = err && err.message ? err.message : String(err);
+        const key = `errorHandler|${module}|${message}`;
+        if (this.activeErrors.has(key)) {
+            this.log.debug(`PJLink error in method: [${module}] error: ${message} (repeated)`);
+            return;
+        }
+        this.activeErrors.add(key);
+        this.log.error(
+            `PJLink error in method: [${module}] error: ${message}, stack: ${err && err.stack}. Repetitions are logged as debug until the error is resolved`,
+        );
+    }
+
+    /**
+     * Log a message only once when the error newly occurs. Repetitions are logged as debug
+     * until resetErrors() is called (e.g. after a successful answer of the projector).
+     *
+     * @param {string} key a key to identify the error
+     * @param {'error' | 'warn' | 'info'} level the log level for the first occurrence
+     * @param {string} message the message to log
+     */
+    logOnce(key, level, message) {
+        if (this.activeErrors.has(key)) {
+            this.log.debug(`${message} (repeated)`);
+            return;
+        }
+        this.activeErrors.add(key);
+        this.log[level](`${message}. Repetitions are logged as debug until the error is resolved`);
+    }
+
+    /**
+     * Reset the memory of logged errors, called when the communication with the projector works again.
+     * Logs the recovery once.
+     */
+    resetErrors() {
+        if (this.activeErrors.size > 0) {
+            this.log.info(`PJLink communication with the projector is working again, previous errors are resolved`);
+            this.activeErrors.clear();
+        }
     }
 
     /**
